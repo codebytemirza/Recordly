@@ -382,7 +382,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const [isMacOS, setIsMacOS] = useState(false);
 	const [microphoneEnabled, setMicrophoneEnabled] = useState(false);
 	const [microphoneDeviceId, setMicrophoneDeviceId] = useState<string | undefined>(undefined);
-	const [systemAudioEnabled, setSystemAudioEnabled] = useState(false);
+	const [systemAudioEnabled, setSystemAudioEnabled] = useState(true);
 	const [webcamEnabled, setWebcamEnabled] = useState(false);
 	const [webcamDeviceId, setWebcamDeviceId] = useState<string | undefined>(undefined);
 	const [countdownDelay, setCountdownDelayState] = useState(3);
@@ -433,6 +433,40 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	);
 	const requestedBrowserMicrophoneProfile = useRef<string | null>(null);
 	const hideEditorOverlayCursorByDefault = useRef(false);
+	const silentAudioKeeperContext = useRef<AudioContext | null>(null);
+
+	const startSilentAudioKeeper = useCallback(() => {
+		try {
+			if (silentAudioKeeperContext.current) return;
+			const AudioCtx =
+				window.AudioContext ||
+				(window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+			if (!AudioCtx) return;
+			const ctx = new AudioCtx();
+			const osc = ctx.createOscillator();
+			const gain = ctx.createGain();
+			gain.gain.value = 0.00001;
+			osc.connect(gain);
+			gain.connect(ctx.destination);
+			osc.start();
+			silentAudioKeeperContext.current = ctx;
+			console.log(
+				"[useScreenRecorder] Silent audio keeper started to keep WASAPI loopback capturing from 0.0s",
+			);
+		} catch (e) {
+			console.warn("[useScreenRecorder] Failed to start silent audio keeper:", e);
+		}
+	}, []);
+
+	const stopSilentAudioKeeper = useCallback(() => {
+		try {
+			if (silentAudioKeeperContext.current) {
+				void silentAudioKeeperContext.current.close();
+				silentAudioKeeperContext.current = null;
+				console.log("[useScreenRecorder] Silent audio keeper stopped");
+			}
+		} catch {}
+	}, []);
 
 	const notifyRecordingFinalizationFailure = useCallback(async (message: string) => {
 		setFinalizing(false);
@@ -636,6 +670,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			mixingContext.current.close().catch(() => undefined);
 			mixingContext.current = null;
 		}
+
+		stopSilentAudioKeeper();
 
 		if (micFallbackRecorder.current) {
 			try {
@@ -1290,6 +1326,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			void (async () => {
 				const stopStart = performance.now();
 				console.log("[PERF:RENDERER] Total Stop Sequence: STARTED");
+				stopSilentAudioKeeper();
 
 				const fallbackStartDelayMs = micFallbackStartDelayMs.current;
 				const fallbackTrackSettings = micFallbackTrackSettings.current;
@@ -1532,7 +1569,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (result.microphoneDeviceId) {
 					setMicrophoneDeviceId(result.microphoneDeviceId);
 				}
-				setSystemAudioEnabled(result.systemAudioEnabled);
+				setSystemAudioEnabled(result.systemAudioEnabled ?? true);
 				setWebcamEnabled(result.webcamEnabled);
 				if (result.webcamDeviceId) {
 					setWebcamDeviceId(result.webcamDeviceId);
@@ -1691,7 +1728,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			const { selectedSource, useNativeMacScreenCapture, useNativeWindowsCapture, micLabel } =
 				preparedStart;
 			const useNativeCapture = useNativeMacScreenCapture || useNativeWindowsCapture;
-			const shouldWarmStartNativeCapture = useNativeCapture && countdownDelay > 0;
+			const shouldWarmStartNativeCapture = useNativeMacScreenCapture && countdownDelay > 0;
 			if (countdownDelay > 0 && !shouldWarmStartNativeCapture) {
 				setCountdownActive(true);
 				try {
@@ -1711,6 +1748,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			let nativeWindowsCaptureStartFailed = false;
 
 			if (useNativeCapture) {
+				if (systemAudioEnabled) {
+					startSilentAudioKeeper();
+				}
 				const nativeResult = await window.electronAPI.startNativeScreenRecording(
 					selectedSource,
 					{
@@ -1721,6 +1761,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					},
 				);
 				if (nativeResult.success && startWasCancelled()) {
+					stopSilentAudioKeeper();
 					nativeScreenRecording.current = true;
 					nativeWindowsRecording.current = useNativeWindowsCapture;
 					nativeWarmStartActive.current = shouldWarmStartNativeCapture;
@@ -1730,6 +1771,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					return;
 				}
 				if (!nativeResult.success) {
+					stopSilentAudioKeeper();
 					if (useNativeWindowsCapture) {
 						nativeWindowsCaptureStartFailed = true;
 						console.warn(
@@ -1972,11 +2014,13 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 			if (wantsAudioCapture) {
 				let screenMediaStream: MediaStream;
-				const acquireLinuxPortalStream = (withAudio: boolean) =>
+				const acquireDisplayStream = (withAudio: boolean) =>
 					mediaDevices.getDisplayMedia({
 						audio: withAudio,
 						video: {
-							displaySurface: "monitor",
+							displaySurface: selectedSource.id?.startsWith("window:")
+								? "window"
+								: "monitor",
 							width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
 							height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
 							frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
@@ -1988,39 +2032,48 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 				if (systemAudioEnabled) {
 					try {
-						screenMediaStream = useLinuxPortal
-							? await acquireLinuxPortalStream(true)
-							: await mediaDevices.getUserMedia({
-									audio: {
-										mandatory: {
-											chromeMediaSource: CHROME_MEDIA_SOURCE,
-											chromeMediaSourceId: browserCaptureSource.id,
-										},
-									},
-									video: browserScreenVideoConstraints,
-								});
-					} catch (audioError) {
+						screenMediaStream = await acquireDisplayStream(true);
+					} catch (displayMediaError) {
 						console.warn(
-							"System audio capture failed, falling back to video-only:",
-							audioError,
+							"getDisplayMedia with audio failed, attempting getUserMedia fallback:",
+							displayMediaError,
 						);
-						alert(
-							"System audio is not available for this source. Recording will continue without system audio.",
-						);
-						screenMediaStream = useLinuxPortal
-							? await acquireLinuxPortalStream(false)
-							: await mediaDevices.getUserMedia({
+						try {
+							screenMediaStream = await mediaDevices.getUserMedia({
+								audio: {
+									mandatory: {
+										chromeMediaSource: CHROME_MEDIA_SOURCE,
+									},
+								},
+								video: browserScreenVideoConstraints,
+							});
+						} catch (audioError) {
+							console.warn(
+								"System audio capture failed, falling back to video-only:",
+								audioError,
+							);
+							toast.warning(
+								"System audio is not available for this source. Recording will continue without system audio.",
+							);
+							try {
+								screenMediaStream = await acquireDisplayStream(false);
+							} catch {
+								screenMediaStream = await mediaDevices.getUserMedia({
 									audio: false,
 									video: browserScreenVideoConstraints,
 								});
+							}
+						}
 					}
 				} else {
-					screenMediaStream = useLinuxPortal
-						? await acquireLinuxPortalStream(false)
-						: await mediaDevices.getUserMedia({
-								audio: false,
-								video: browserScreenVideoConstraints,
-							});
+					try {
+						screenMediaStream = await acquireDisplayStream(false);
+					} catch {
+						screenMediaStream = await mediaDevices.getUserMedia({
+							audio: false,
+							video: browserScreenVideoConstraints,
+						});
+					}
 				}
 
 				screenStream.current = screenMediaStream;

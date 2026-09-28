@@ -87,8 +87,7 @@ function findCmake() {
 	return null;
 }
 
-const cmake = findCmake();
-if (!cmake) {
+function fallbackToBundledHelperOrExit(reason) {
 	if (existsSync(bundledExePath)) {
 		const verification = verifyNativeHelperManifest({
 			projectRoot,
@@ -100,14 +99,20 @@ if (!cmake) {
 		if (!verification.ok) {
 			console.warn(formatNativeHelperManifestWarning("build-cursor-monitor", verification));
 		}
+		console.log(`[build-cursor-monitor] ${reason}`);
 		console.log(`[build-cursor-monitor] Using bundled helper: ${bundledExePath}`);
 		process.exit(0);
 	}
 
-	console.error(
-		"[build-cursor-monitor] CMake not found. Install Visual Studio with C++ CMake tools or standalone CMake.",
-	);
+	console.error(`[build-cursor-monitor] ${reason}`);
 	process.exit(1);
+}
+
+const cmake = findCmake();
+if (!cmake) {
+	fallbackToBundledHelperOrExit(
+		"CMake not found. Install Visual Studio with C++ CMake tools or standalone CMake.",
+	);
 }
 
 mkdirSync(buildDir, { recursive: true });
@@ -132,8 +137,7 @@ try {
 			}),
 	});
 } catch (error) {
-	console.error("[build-cursor-monitor] CMake configure failed:", error.message);
-	process.exit(1);
+	fallbackToBundledHelperOrExit(`CMake configure failed: ${error.message}`);
 }
 
 console.log("[build-cursor-monitor] Building...");
@@ -144,8 +148,7 @@ try {
 		timeout: 300000,
 	});
 } catch (error) {
-	console.error("[build-cursor-monitor] Build failed:", error.message);
-	process.exit(1);
+	fallbackToBundledHelperOrExit(`Build failed: ${error.message}`);
 }
 
 const exePath = path.join(buildDir, "Release", "cursor-monitor.exe");

@@ -1127,7 +1127,10 @@ app.whenReady().then(async () => {
 			const isLinuxPortalSentinel =
 				process.platform === "linux" && (sourceId === "screen:linux-portal" || !sourceId);
 			if (isLinuxPortalSentinel) {
-				callback({ video: { id: "screen:0:0", name: "Entire screen" } });
+				callback({
+					video: { id: "screen:0:0", name: "Entire screen" },
+					audio: request.audioRequested ? "loopback" : undefined,
+				});
 				return;
 			}
 			const sources = await desktopCapturer.getSources({ types: ["screen", "window"] });
@@ -1137,6 +1140,7 @@ app.whenReady().then(async () => {
 			if (source) {
 				callback({
 					video: { id: source.id, name: source.name },
+					audio: request.audioRequested ? "loopback" : undefined,
 				});
 			} else {
 				callback({});

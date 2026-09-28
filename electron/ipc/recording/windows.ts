@@ -13,6 +13,7 @@ import {
 	windowsCaptureTargetPath,
 	windowsNativeCaptureActive,
 } from "../state";
+import path from "node:path";
 import { AudioSyncAdjustment } from "../types";
 import { moveFileWithOverwrite } from "../utils";
 import { emitRecordingInterrupted } from "./events";
@@ -196,6 +197,154 @@ export function attachWindowsCaptureLifecycle(proc: ChildProcessWithoutNullStrea
 	});
 }
 
+/**
+ * Prepend silence to a WAV file matching the startDelayMs from its companion JSON metadata.
+ * This physically aligns the audio timeline with the video from t = 0.0s,
+ * removing playback lag, start desynchronization, and preview timing gaps.
+ */
+async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | null): Promise<number> {
+	const jsonPath = `${wavPath}.json`;
+	try {
+		const jsonRaw = await fs.readFile(jsonPath, "utf8").catch(() => null);
+		if (!jsonRaw) return 0;
+		const metadata = JSON.parse(jsonRaw);
+		const startDelayMs = metadata?.startDelayMs;
+		if (!Number.isFinite(startDelayMs) || startDelayMs <= 0) {
+			return 0;
+		}
+
+		const fileStat = await fs.stat(wavPath).catch(() => null);
+		if (!fileStat || fileStat.size < 44) return 0;
+
+		const fileHandle = await fs.open(wavPath, "r");
+		const headerScanBuf = Buffer.alloc(Math.min(1024, fileStat.size));
+		const { bytesRead } = await fileHandle.read(headerScanBuf, 0, headerScanBuf.length, 0);
+
+		if (
+			bytesRead < 44 ||
+			headerScanBuf.toString("ascii", 0, 4) !== "RIFF" ||
+			headerScanBuf.toString("ascii", 8, 12) !== "WAVE"
+		) {
+			await fileHandle.close();
+			return 0;
+		}
+
+		let audioFormat = 1;
+		let channels = 2;
+		let sampleRate = 48000;
+		let blockAlign = 4;
+		let dataChunkOffset = -1;
+
+		let offset = 12;
+		while (offset + 8 <= bytesRead) {
+			const chunkId = headerScanBuf.toString("ascii", offset, offset + 4);
+			const chunkSize = headerScanBuf.readUInt32LE(offset + 4);
+			if (chunkId === "fmt ") {
+				audioFormat = headerScanBuf.readUInt16LE(offset + 8);
+				channels = headerScanBuf.readUInt16LE(offset + 10);
+				sampleRate = headerScanBuf.readUInt32LE(offset + 12);
+				blockAlign = headerScanBuf.readUInt16LE(offset + 20);
+			} else if (chunkId === "data") {
+				dataChunkOffset = offset;
+				break;
+			}
+			offset += 8 + chunkSize;
+		}
+
+		if (dataChunkOffset < 0 || audioFormat !== 1 || channels <= 0 || sampleRate <= 0 || blockAlign <= 0) {
+			await fileHandle.close();
+			return 0;
+		}
+
+		const dataPayloadOffset = dataChunkOffset + 8;
+		const actualDataSize = Math.max(0, fileStat.size - dataPayloadOffset);
+		const audioDurationMs = Math.round((actualDataSize / (sampleRate * blockAlign)) * 1000);
+
+		let effectiveDelayMs = startDelayMs;
+		if (videoPath) {
+			try {
+				const videoStat = await fs.stat(videoPath).catch(() => null);
+				if (videoStat && videoStat.size > 0) {
+					const { probeVideoStreamDurationSeconds } = await import("./diagnostics");
+					const videoDurationSec = await probeVideoStreamDurationSeconds(videoPath);
+					if (videoDurationSec && videoDurationSec > 0) {
+						const videoDurationMs = Math.round(videoDurationSec * 1000);
+						const maxRealisticDelayMs = Math.max(0, videoDurationMs - audioDurationMs);
+						if (startDelayMs > maxRealisticDelayMs) {
+							console.log(
+								`[mux-win] Correcting inflated startDelayMs from ${startDelayMs}ms to ${maxRealisticDelayMs}ms (video: ${videoDurationMs}ms, audio: ${audioDurationMs}ms)`,
+							);
+							effectiveDelayMs = maxRealisticDelayMs;
+						}
+					}
+				}
+			} catch {
+				// Fallback to startDelayMs
+			}
+		}
+
+		const numSilenceFrames = Math.round((effectiveDelayMs / 1000) * sampleRate);
+		const silenceBytes = numSilenceFrames * blockAlign;
+		if (silenceBytes <= 0) {
+			await fileHandle.close();
+			metadata.startDelayMs = 0;
+			await fs.writeFile(jsonPath, JSON.stringify(metadata, null, 2), "utf8");
+			return 0;
+		}
+
+		const totalNewDataSize = actualDataSize + silenceBytes;
+		const totalNewRiffSize = dataPayloadOffset - 8 + totalNewDataSize;
+
+		const headerToCopy = Buffer.alloc(dataPayloadOffset);
+		await fileHandle.read(headerToCopy, 0, dataPayloadOffset, 0);
+		headerToCopy.writeUInt32LE(totalNewRiffSize, 4);
+		headerToCopy.writeUInt32LE(totalNewDataSize, dataChunkOffset + 4);
+
+		const tempPath = `${wavPath}.sync.tmp`;
+		const writeHandle = await fs.open(tempPath, "w");
+		await writeHandle.write(headerToCopy);
+
+		const zeroChunkSize = 65536;
+		const zeroBuf = Buffer.alloc(zeroChunkSize, 0);
+		let remainingSilence = silenceBytes;
+		while (remainingSilence > 0) {
+			const toWrite = Math.min(remainingSilence, zeroChunkSize);
+			await writeHandle.write(zeroBuf, 0, toWrite);
+			remainingSilence -= toWrite;
+		}
+
+		const copyBuf = Buffer.alloc(65536);
+		let readPos = dataPayloadOffset;
+		while (readPos < fileStat.size) {
+			const toRead = Math.min(copyBuf.length, fileStat.size - readPos);
+			const { bytesRead: count } = await fileHandle.read(copyBuf, 0, toRead, readPos);
+			if (count <= 0) break;
+			await writeHandle.write(copyBuf, 0, count);
+			readPos += count;
+		}
+
+		await fileHandle.close();
+		await writeHandle.close();
+
+		await fs.rename(tempPath, wavPath);
+
+		metadata.startDelayMs = 0;
+		metadata.capturedDurationMs = (metadata.capturedDurationMs ?? 0) + effectiveDelayMs;
+		metadata.dataBytes = totalNewDataSize;
+		metadata.insertedSilenceFrames = (metadata.insertedSilenceFrames ?? 0) + numSilenceFrames;
+		metadata.prePaddedSilenceMs = effectiveDelayMs;
+		await fs.writeFile(jsonPath, JSON.stringify(metadata, null, 2), "utf8");
+
+		console.log(
+			`[mux-win] Pre-padded ${effectiveDelayMs}ms (${silenceBytes} bytes) of silence to ${path.basename(wavPath)}. Sidecar is now self-synced with startDelayMs=0.`,
+		);
+		return effectiveDelayMs;
+	} catch (error) {
+		console.warn(`[mux-win] Failed to align WAV sidecar ${wavPath}:`, error);
+		return 0;
+	}
+}
+
 export async function muxNativeWindowsVideoWithAudio(
 	videoPath: string,
 	systemAudioPath: string | null,
@@ -208,8 +357,8 @@ export async function muxNativeWindowsVideoWithAudio(
 
 	const videoPathWithoutExt = videoPath.replace(/\.[^.]+$/u, "");
 
-	// Optimization: instead of heavy FFmpeg muxing, we just move the audio sidecars
-	// to their final companion paths so the editor can find them as separate tracks.
+	// Optimization: instead of heavy FFmpeg muxing, we move audio sidecars
+	// to companion paths and pre-pad silence so tracks are self-synced from 0.0s.
 	if (systemAudioPath) {
 		const finalSystemPath = `${videoPathWithoutExt}.system.wav`;
 		try {
@@ -217,13 +366,22 @@ export async function muxNativeWindowsVideoWithAudio(
 			if (stat.size > 0) {
 				if (systemAudioPath !== finalSystemPath) {
 					await moveFileWithOverwrite(systemAudioPath, finalSystemPath);
+					const sourceJson = `${systemAudioPath}.json`;
+					const targetJson = `${finalSystemPath}.json`;
+					try {
+						await moveFileWithOverwrite(sourceJson, targetJson);
+					} catch {
+						// Ignored if json doesn't exist
+					}
 				}
+				await alignWavSidecarWithSilence(finalSystemPath, videoPath);
+				const finalStat = await fs.stat(finalSystemPath);
 				audioInputs.push("system");
 				audio.system = {
 					path: finalSystemPath,
-					sizeBytes: stat.size,
+					sizeBytes: finalStat.size,
 					durationSeconds: 0,
-					startDelayMs: null,
+					startDelayMs: 0,
 					adjustment: { mode: "none", delayMs: 0, tempoRatio: 1, durationDeltaMs: 0 },
 				};
 			}
@@ -239,13 +397,22 @@ export async function muxNativeWindowsVideoWithAudio(
 			if (stat.size > 0) {
 				if (micAudioPath !== finalMicPath) {
 					await moveFileWithOverwrite(micAudioPath, finalMicPath);
+					const sourceJson = `${micAudioPath}.json`;
+					const targetJson = `${finalMicPath}.json`;
+					try {
+						await moveFileWithOverwrite(sourceJson, targetJson);
+					} catch {
+						// Ignored if json doesn't exist
+					}
 				}
+				await alignWavSidecarWithSilence(finalMicPath, videoPath);
+				const finalStat = await fs.stat(finalMicPath);
 				audioInputs.push("mic");
 				audio.mic = {
 					path: finalMicPath,
-					sizeBytes: stat.size,
+					sizeBytes: finalStat.size,
 					durationSeconds: 0,
-					startDelayMs: null,
+					startDelayMs: 0,
 					adjustment: { mode: "none", delayMs: 0, tempoRatio: 1, durationDeltaMs: 0 },
 				};
 			}
