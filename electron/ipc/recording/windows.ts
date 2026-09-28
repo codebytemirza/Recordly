@@ -355,6 +355,9 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 		return effectiveDelayMs;
 	} catch (error) {
 		// Clean up temp file on any failure after it was created.
+		// Close writeHandle first (Windows cannot remove an open file).
+		await writeHandle?.close().catch(() => { /* ignore close failure */ });
+		writeHandle = null;
 		await fs.rm(tempPath, { force: true }).catch(() => { /* ignore cleanup failure */ });
 		console.warn(`[mux-win] Failed to align WAV sidecar ${wavPath}:`, error);
 		return 0;
