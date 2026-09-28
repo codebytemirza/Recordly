@@ -1715,6 +1715,14 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			window.electronAPI?.hudOverlaySetSourceSelectionActive?.(active);
 		};
 
+		// Fix 5: track whether recording became active so we can release the silent audio keeper on early exits.
+		let recordingActivated = false;
+		const ensureSilentKeeperStopped = () => {
+			if (!recordingActivated) {
+				stopSilentAudioKeeper();
+			}
+		};
+
 		hasPromptedForReselect.current = false;
 		startInFlight.current = true;
 		setStarting(true);
@@ -1808,6 +1816,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						nativeWarmStartActive.current = true;
 						const pauseResult = await window.electronAPI.pauseNativeScreenRecording();
 						if (startWasCancelled()) {
+							ensureSilentKeeperStopped();
 							return;
 						}
 						if (!pauseResult.success) {
@@ -1830,6 +1839,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 								if (!startWasCancelled()) {
 									await discardActiveNativeCapture();
 								}
+								ensureSilentKeeperStopped();
 								cleanupCapturedMedia();
 								await stopWebcamRecorder();
 								return;
@@ -1840,6 +1850,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 						const resumeResult = await window.electronAPI.resumeNativeScreenRecording();
 						if (startWasCancelled()) {
+							ensureSilentKeeperStopped();
 							return;
 						}
 						if (!resumeResult.success) {
@@ -1852,9 +1863,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						nativeWarmStartActive.current = false;
 					}
 					if (startWasCancelled()) {
+						ensureSilentKeeperStopped();
 						return;
 					}
 
+					recordingActivated = true;
 					const mainStartedAt = Date.now();
 					micFallbackStartDelayMs.current = null;
 					beginWebcamCapture();
@@ -1931,10 +1944,12 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					if (startWasCancelled()) {
 						await stopMicFallbackRecorder();
 						await stopWebcamRecorder();
+						ensureSilentKeeperStopped();
 						cleanupCapturedMedia();
 						return;
 					}
 
+					recordingActivated = true;
 					setRecording(true);
 					try {
 						await window.electronAPI?.setRecordingState(true);
@@ -2035,7 +2050,21 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (systemAudioEnabled) {
 					try {
 						screenMediaStream = await acquireDisplayStream(true);
+						// Fix 6: getDisplayMedia succeeded but returned no audio tracks although system audio was requested.
+						if (systemAudioEnabled && screenMediaStream.getAudioTracks().length === 0) {
+							console.warn("getDisplayMedia returned no audio tracks despite system audio being requested");
+							toast.warning(
+								"System audio capture returned no audio track. Recording will continue without system audio.",
+							);
+						}
 					} catch (displayMediaError) {
+						// Fix 7: if the user cancelled the picker, re-throw to avoid reopening it via fallback.
+						if (
+							displayMediaError instanceof DOMException &&
+							displayMediaError.name === "AbortError"
+						) {
+							throw displayMediaError;
+						}
 						console.warn(
 							"getDisplayMedia with audio failed, attempting getUserMedia fallback:",
 							displayMediaError,
