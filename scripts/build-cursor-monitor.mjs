@@ -97,7 +97,8 @@ function fallbackToBundledHelperOrExit(reason) {
 			binaryName: "cursor-monitor.exe",
 		});
 		if (!verification.ok) {
-			console.warn(formatNativeHelperManifestWarning("build-cursor-monitor", verification));
+			console.error(formatNativeHelperManifestWarning("build-cursor-monitor", verification));
+			process.exit(1);
 		}
 		console.log(`[build-cursor-monitor] ${reason}`);
 		console.log(`[build-cursor-monitor] Using bundled helper: ${bundledExePath}`);

@@ -100,7 +100,8 @@ function fallbackToBundledHelperOrExit(reason) {
 			binaryName: "wgc-capture.exe",
 		});
 		if (!verification.ok) {
-			console.warn(formatNativeHelperManifestWarning("build-windows-capture", verification));
+			console.error(formatNativeHelperManifestWarning("build-windows-capture", verification));
+			process.exit(1);
 		}
 		console.log(`[build-windows-capture] ${reason}`);
 		console.log(`[build-windows-capture] Using bundled helper: ${bundledExePath}`);
