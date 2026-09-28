@@ -219,13 +219,15 @@ export function shouldUseNativeWindowsCaptureForSource(
 export function createProcessedMicrophoneConstraints(
 	microphoneDeviceId?: string,
 	profile: BrowserMicrophoneProfile = DEFAULT_BROWSER_MICROPHONE_PROFILE,
+	disableAgc: boolean = false,
 ): MediaStreamConstraints {
 	const normalizedProfile = normalizeBrowserMicrophoneProfile(profile);
 	const audio: MediaTrackConstraints = {
 		echoCancellation: normalizedProfile !== "no-echo" && normalizedProfile !== "raw",
 		noiseSuppression:
 			normalizedProfile !== "no-noise-suppression" && normalizedProfile !== "raw",
-		autoGainControl: normalizedProfile !== "no-agc" && normalizedProfile !== "raw",
+		autoGainControl:
+			!disableAgc && normalizedProfile !== "no-agc" && normalizedProfile !== "raw",
 		channelCount: { ideal: 1 },
 		sampleRate: { ideal: 48000 },
 	};
@@ -440,10 +442,10 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			if (silentAudioKeeperContext.current) return;
 			const AudioCtx =
 				window.AudioContext ||
-				(window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-			if (!AudioCtx) return;
-			const ctx = new AudioCtx();
-			const osc = ctx.createOscillator();
+(window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+		if (!AudioCtx) return;
+		const ctx = new AudioCtx({ sampleRate: 48000 });
+		const osc = ctx.createOscillator();
 			const gain = ctx.createGain();
 			gain.gain.value = 0.00001;
 			osc.connect(gain);
@@ -690,7 +692,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			micFallbackRecorderMetadata.current = null;
 			resetMicFallbackTimingDiagnostics();
 		}
-	}, [resetMicFallbackTimingDiagnostics]);
+	}, [resetMicFallbackTimingDiagnostics, stopSilentAudioKeeper]);
 
 	const appendMicFallbackChunk = useCallback(
 		(event: BlobEvent) => {
@@ -2092,6 +2094,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 							createProcessedMicrophoneConstraints(
 								microphoneDeviceId,
 								browserMicrophoneProfile.current,
+								systemAudioEnabled, // disable AGC when system audio is also captured
 							),
 						);
 					} catch (audioError) {
@@ -2119,8 +2122,20 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					micGain.gain.value = MIC_GAIN_BOOST;
 					const destination = context.createMediaStreamDestination();
 
-					systemSource.connect(destination);
-					micSource.connect(micGain).connect(destination);
+					// Gain staging fix: mix bus at 0.7 + safety limiter (prevents clipping when system+mic both peak).
+					// Note: DynamicsCompressorNode is not a true brickwall limiter and has automatic makeup gain.
+					const mixBus = context.createGain();
+					mixBus.gain.value = 0.7;
+					const limiter = context.createDynamicsCompressor();
+					limiter.threshold.value = -10; // dB
+					limiter.knee.value = 6;
+					limiter.ratio.value = 20;
+					limiter.attack.value = 0.003;
+					limiter.release.value = 0.15;
+					mixBus.connect(limiter).connect(destination);
+
+					systemSource.connect(mixBus);
+					micSource.connect(micGain).connect(mixBus);
 
 					const mixedTrack = destination.stream.getAudioTracks()[0];
 					if (mixedTrack) {
