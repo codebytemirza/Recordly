@@ -204,6 +204,10 @@ export function attachWindowsCaptureLifecycle(proc: ChildProcessWithoutNullStrea
  */
 async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | null): Promise<number> {
 	const jsonPath = `${wavPath}.json`;
+	let fileHandle: Awaited<ReturnType<typeof fs.open>> | null = null;
+	let writeHandle: Awaited<ReturnType<typeof fs.open>> | null = null;
+	const tempPath = `${wavPath}.sync.tmp`;
+
 	try {
 		const jsonRaw = await fs.readFile(jsonPath, "utf8").catch(() => null);
 		if (!jsonRaw) return 0;
@@ -216,7 +220,7 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 		const fileStat = await fs.stat(wavPath).catch(() => null);
 		if (!fileStat || fileStat.size < 44) return 0;
 
-		const fileHandle = await fs.open(wavPath, "r");
+		fileHandle = await fs.open(wavPath, "r");
 		const headerScanBuf = Buffer.alloc(Math.min(1024, fileStat.size));
 		const { bytesRead } = await fileHandle.read(headerScanBuf, 0, headerScanBuf.length, 0);
 
@@ -225,7 +229,6 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 			headerScanBuf.toString("ascii", 0, 4) !== "RIFF" ||
 			headerScanBuf.toString("ascii", 8, 12) !== "WAVE"
 		) {
-			await fileHandle.close();
 			return 0;
 		}
 
@@ -234,6 +237,7 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 		let sampleRate = 48000;
 		let blockAlign = 4;
 		let dataChunkOffset = -1;
+		let declaredDataSize = 0;
 
 		let offset = 12;
 		while (offset + 8 <= bytesRead) {
@@ -246,19 +250,25 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 				blockAlign = headerScanBuf.readUInt16LE(offset + 20);
 			} else if (chunkId === "data") {
 				dataChunkOffset = offset;
+				declaredDataSize = chunkSize;
 				break;
 			}
-			offset += 8 + chunkSize;
+			// WAV chunks are padded to even size; include pad byte in walk.
+			offset += 8 + chunkSize + (chunkSize & 1);
 		}
 
 		if (dataChunkOffset < 0 || audioFormat !== 1 || channels <= 0 || sampleRate <= 0 || blockAlign <= 0) {
-			await fileHandle.close();
 			return 0;
 		}
 
 		const dataPayloadOffset = dataChunkOffset + 8;
-		const actualDataSize = Math.max(0, fileStat.size - dataPayloadOffset);
-		const audioDurationMs = Math.round((actualDataSize / (sampleRate * blockAlign)) * 1000);
+		const availableBytes = Math.max(0, fileStat.size - dataPayloadOffset);
+		// Native recorder may write 0 or 0xFFFFFFFF as streaming placeholder; fall back to available bytes.
+		const isPlaceholder = declaredDataSize === 0 || declaredDataSize === 0xffffffff;
+		const actualDataSize = isPlaceholder ? availableBytes : Math.min(declaredDataSize, availableBytes);
+		// Round down to full frames.
+		const boundedDataSize = actualDataSize - (actualDataSize % blockAlign);
+		const audioDurationMs = Math.round((boundedDataSize / (sampleRate * blockAlign)) * 1000);
 
 		let effectiveDelayMs = startDelayMs;
 		if (videoPath) {
@@ -286,13 +296,12 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 		const numSilenceFrames = Math.round((effectiveDelayMs / 1000) * sampleRate);
 		const silenceBytes = numSilenceFrames * blockAlign;
 		if (silenceBytes <= 0) {
-			await fileHandle.close();
 			metadata.startDelayMs = 0;
 			await fs.writeFile(jsonPath, JSON.stringify(metadata, null, 2), "utf8");
 			return 0;
 		}
 
-		const totalNewDataSize = actualDataSize + silenceBytes;
+		const totalNewDataSize = boundedDataSize + silenceBytes;
 		const totalNewRiffSize = dataPayloadOffset - 8 + totalNewDataSize;
 
 		const headerToCopy = Buffer.alloc(dataPayloadOffset);
@@ -300,8 +309,7 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 		headerToCopy.writeUInt32LE(totalNewRiffSize, 4);
 		headerToCopy.writeUInt32LE(totalNewDataSize, dataChunkOffset + 4);
 
-		const tempPath = `${wavPath}.sync.tmp`;
-		const writeHandle = await fs.open(tempPath, "w");
+		writeHandle = await fs.open(tempPath, "w");
 		await writeHandle.write(headerToCopy);
 
 		const zeroChunkSize = 65536;
@@ -315,16 +323,22 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 
 		const copyBuf = Buffer.alloc(65536);
 		let readPos = dataPayloadOffset;
-		while (readPos < fileStat.size) {
-			const toRead = Math.min(copyBuf.length, fileStat.size - readPos);
+		const copyEnd = dataPayloadOffset + boundedDataSize;
+		while (readPos < copyEnd) {
+			const toRead = Math.min(copyBuf.length, copyEnd - readPos);
 			const { bytesRead: count } = await fileHandle.read(copyBuf, 0, toRead, readPos);
 			if (count <= 0) break;
 			await writeHandle.write(copyBuf, 0, count);
 			readPos += count;
 		}
 
-		await fileHandle.close();
+		// Trailing chunks after 'data' (e.g., LIST) are dropped; they are not audio samples.
+		// If needed later, they can be preserved by appending them after the copy loop.
+
 		await writeHandle.close();
+		writeHandle = null;
+		await fileHandle.close();
+		fileHandle = null;
 
 		await fs.rename(tempPath, wavPath);
 
@@ -340,8 +354,14 @@ async function alignWavSidecarWithSilence(wavPath: string, videoPath?: string | 
 		);
 		return effectiveDelayMs;
 	} catch (error) {
+		// Clean up temp file on any failure after it was created.
+		await fs.rm(tempPath, { force: true }).catch(() => { /* ignore cleanup failure */ });
 		console.warn(`[mux-win] Failed to align WAV sidecar ${wavPath}:`, error);
 		return 0;
+	} finally {
+		// Ensure handles are closed on all paths (including early returns above).
+		await writeHandle?.close().catch(() => { /* ignore close failure */ });
+		await fileHandle?.close().catch(() => { /* ignore close failure */ });
 	}
 }
 
